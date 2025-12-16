@@ -3,36 +3,77 @@ use hyper::header::{AUTHORIZATION, HeaderValue};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server, StatusCode};
 use std::convert::Infallible;
+use std::sync::Arc;
 
-// Конфигурация прокси
-//const REQUEST_TIMEOUT_SEC: u64 = 90;
+#[derive(Clone)]
+struct ProxyConfig {
+    remote_host: String,
+    path_prefix: String,
+    auth_user: String,
+    auth_pass: String,
+}
+
+impl ProxyConfig {
+    fn from_env() -> Self {
+        dotenvy::dotenv().ok();
+        
+        Self {
+            remote_host: dotenvy::var("REMOTE_HOST")
+                .unwrap_or_else(|_| "https://example.com:8443".to_string()),
+            path_prefix: dotenvy::var("PATH_PREFIX")
+                .unwrap_or_else(|_| "/v1".to_string()),
+            auth_user: dotenvy::var("AUTH_USER")
+                .unwrap_or_else(|_| "user".to_string()),
+            auth_pass: dotenvy::var("AUTH_PASS")
+                .unwrap_or_else(|_| "password".to_string()),
+        }
+    }
+
+    fn build_remote_url(&self, path: &str, query: &str) -> String {
+        format!("{}{}{}{}", self.remote_host, self.path_prefix, path, query)
+    }
+
+    fn create_auth_header(&self) -> Result<HeaderValue, Box<dyn std::error::Error>> {
+        let credentials = format!("{}:{}", self.auth_user, self.auth_pass);
+        let encoded = general_purpose::STANDARD.encode(credentials.as_bytes());
+        let auth_value = format!("Basic {}", encoded);
+        Ok(HeaderValue::from_str(&auth_value)?)
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
-    let local_addr = dotenvy::var("LOCAL_ADDR").unwrap_or("127.0.0.1:8050".to_string());
-    let remote_host = dotenvy::var("REMOTE_HOST").unwrap_or("https://example.com:8443".to_string());
-    let path_prefix = dotenvy::var("PATH_PREFIX").unwrap_or("/v1".to_string());
-    let auth_user = dotenvy::var("AUTH_USER").unwrap_or("user".to_string());
-    let auth_pass = dotenvy::var("AUTH_PASS").unwrap_or("password".to_string());
+    let config = Arc::new(ProxyConfig::from_env());
+    let local_addr = dotenvy::var("LOCAL_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8050".to_string());
 
     let addr = local_addr.parse().unwrap();
 
-    let make_svc =
-        make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle_request)) });
+    println!("Прокси запущен на http://{}", local_addr);
+    println!("Проксирует на {}{}", config.remote_host, config.path_prefix);
+
+    let make_svc = make_service_fn(move |_conn| {
+        let config = Arc::clone(&config);
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| {
+                let config = Arc::clone(&config);
+                async move { handle_request(req, config).await }
+            }))
+        }
+    });
 
     let server = Server::bind(&addr).serve(make_svc);
-
-    println!("Прокси запущен на http://{}", local_addr);
-    println!("Проксирует на {}{}", remote_host, path_prefix);
 
     if let Err(e) = server.await {
         eprintln!("Ошибка сервера: {}", e);
     }
 }
 
-async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    match proxy_request(req).await {
+async fn handle_request(
+    req: Request<Body>,
+    config: Arc<ProxyConfig>,
+) -> Result<Response<Body>, Infallible> {
+    match proxy_request(req, config).await {
         Ok(response) => Ok(response),
         Err(e) => {
             eprintln!("Ошибка прокси: {}", e);
@@ -44,7 +85,10 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     }
 }
 
-async fn proxy_request(req: Request<Body>) -> Result<Response<Body>, Box<dyn std::error::Error>> {
+async fn proxy_request(
+    req: Request<Body>,
+    config: Arc<ProxyConfig>,
+) -> Result<Response<Body>, Box<dyn std::error::Error>> {
     let method = req.method().clone();
     let path = req.uri().path();
     let query = req
@@ -54,14 +98,10 @@ async fn proxy_request(req: Request<Body>) -> Result<Response<Body>, Box<dyn std
         .unwrap_or_default();
 
     // Формируем новый URL с префиксом
-    let remote_url = format!("{}{}{}{}", remote_host, path_prefix, path, query);
+    let remote_url = config.build_remote_url(path, &query);
 
     println!("{} {} -> {}", method, req.uri(), remote_url);
 
-    // Создаём Basic Auth заголовок
-    let credentials = format!("{}:{}", auth_user, auth_pass);
-    let encoded = general_purpose::STANDARD.encode(credentials.as_bytes());
-    let auth_value = format!("Basic {}", encoded);
     // Создаём новый запрос
     let mut new_req = Request::builder().method(method).uri(remote_url);
 
@@ -73,7 +113,7 @@ async fn proxy_request(req: Request<Body>) -> Result<Response<Body>, Box<dyn std
     }
 
     // Добавляем Basic Authorization
-    new_req = new_req.header(AUTHORIZATION, HeaderValue::from_str(&auth_value)?);
+    new_req = new_req.header(AUTHORIZATION, config.create_auth_header()?);
 
     let new_req = new_req.body(req.into_body())?;
 
@@ -82,11 +122,6 @@ async fn proxy_request(req: Request<Body>) -> Result<Response<Body>, Box<dyn std
     let client = Client::builder().build::<_, Body>(https);
 
     let response = client.request(new_req).await?;
-    // Отправляем запрос с таймаутом
-    //let response = tokio::time::timeout(
-    //    tokio::time::Duration::from_secs(REQUEST_TIMEOUT_SEC),
-    //    client.request(new_req)
-    //).await??;
 
     let status = response.status();
     println!("← Статус: {}", status);
