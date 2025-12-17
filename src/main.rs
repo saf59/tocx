@@ -16,16 +16,13 @@ struct ProxyConfig {
 impl ProxyConfig {
     fn from_env() -> Self {
         dotenvy::dotenv().ok();
-        
+
         Self {
             remote_host: dotenvy::var("REMOTE_HOST")
                 .unwrap_or_else(|_| "https://example.com:8443".to_string()),
-            path_prefix: dotenvy::var("PATH_PREFIX")
-                .unwrap_or_else(|_| "/v1".to_string()),
-            auth_user: dotenvy::var("AUTH_USER")
-                .unwrap_or_else(|_| "user".to_string()),
-            auth_pass: dotenvy::var("AUTH_PASS")
-                .unwrap_or_else(|_| "password".to_string()),
+            path_prefix: dotenvy::var("PATH_PREFIX").unwrap_or_else(|_| "/v1".to_string()),
+            auth_user: dotenvy::var("AUTH_USER").unwrap_or_else(|_| "user".to_string()),
+            auth_pass: dotenvy::var("AUTH_PASS").unwrap_or_else(|_| "password".to_string()),
         }
     }
 
@@ -44,8 +41,7 @@ impl ProxyConfig {
 #[tokio::main]
 async fn main() {
     let config = Arc::new(ProxyConfig::from_env());
-    let local_addr = dotenvy::var("LOCAL_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8050".to_string());
+    let local_addr = dotenvy::var("LOCAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8050".to_string());
 
     let addr = local_addr.parse().unwrap();
 
@@ -118,7 +114,17 @@ async fn proxy_request(
     let new_req = new_req.body(req.into_body())?;
 
     // Отправляем запрос
-    let https = hyper_tls::HttpsConnector::new();
+    //let https = hyper_tls::HttpsConnector::new();
+    // Отправляем запрос (с поддержкой самоподписанных сертификатов)
+    let mut http = hyper::client::HttpConnector::new();
+    http.enforce_http(false);
+
+    let tls = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()?;
+
+    let https = hyper_tls::HttpsConnector::from((http, tls.into()));
     let client = Client::builder().build::<_, Body>(https);
 
     let response = client.request(new_req).await?;
